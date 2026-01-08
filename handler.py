@@ -1,286 +1,212 @@
 import runpod
 from runpod.serverless.utils import rp_upload
+
 import os
-import websocket
-import base64
 import json
 import uuid
+import time
 import logging
+import websocket
 import urllib.request
 import urllib.parse
-import binascii # Base64 에러 처리를 위해 import
 import subprocess
-import time
+import base64
+import binascii
 
-# 로깅 설정
+# ======================
+# LOGGING
+# ======================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ======================
+# GLOBAL CONFIG
+# ======================
+SERVER_ADDRESS = os.getenv("SERVER_ADDRESS", "127.0.0.1")
+CLIENT_ID = str(uuid.uuid4())
 
-server_address = os.getenv('SERVER_ADDRESS', '127.0.0.1')
-client_id = str(uuid.uuid4())
-def save_data_if_base64(data_input, temp_dir, output_filename):
-    """
-    입력 데이터가 Base64 문자열인지 확인하고, 맞다면 파일로 저장 후 경로를 반환합니다.
-    만약 일반 경로 문자열이라면 그대로 반환합니다.
-    """
-    # 입력값이 문자열이 아니면 그대로 반환
-    if not isinstance(data_input, str):
-        return data_input
+# ======================
+# UTIL FUNCTIONS
+# ======================
+def load_workflow(path: str):
+    with open(path, "r") as f:
+        return json.load(f)
 
-    try:
-        # Base64 문자열은 디코딩을 시도하면 성공합니다.
-        decoded_data = base64.b64decode(data_input)
-        
-        # 디렉토리가 존재하지 않으면 생성
-        os.makedirs(temp_dir, exist_ok=True)
-        
-        # 디코딩에 성공하면, 임시 파일로 저장합니다.
-        file_path = os.path.abspath(os.path.join(temp_dir, output_filename))
-        with open(file_path, 'wb') as f: # 바이너리 쓰기 모드('wb')로 저장
-            f.write(decoded_data)
-        
-        # 저장된 파일의 경로를 반환합니다.
-        print(f"✅ Base64 입력을 '{file_path}' 파일로 저장했습니다.")
-        return file_path
-
-    except (binascii.Error, ValueError):
-        # 디코딩에 실패하면, 일반 경로로 간주하고 원래 값을 그대로 반환합니다.
-        print(f"➡️ '{data_input}'은(는) 파일 경로로 처리합니다.")
-        return data_input
-    
 def queue_prompt(prompt):
-    url = f"http://{server_address}:8188/prompt"
-    logger.info(f"Queueing prompt to: {url}")
-    p = {"prompt": prompt, "client_id": client_id}
-    data = json.dumps(p).encode('utf-8')
+    url = f"http://{SERVER_ADDRESS}:8188/prompt"
+    payload = {
+        "prompt": prompt,
+        "client_id": CLIENT_ID
+    }
+    data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data)
     return json.loads(urllib.request.urlopen(req).read())
 
-def get_image(filename, subfolder, folder_type):
-    url = f"http://{server_address}:8188/view"
-    logger.info(f"Getting image from: {url}")
-    data = {"filename": filename, "subfolder": subfolder, "type": folder_type}
-    url_values = urllib.parse.urlencode(data)
-    with urllib.request.urlopen(f"{url}?{url_values}") as response:
-        return response.read()
-
 def get_history(prompt_id):
-    url = f"http://{server_address}:8188/history/{prompt_id}"
-    logger.info(f"Getting history from: {url}")
+    url = f"http://{SERVER_ADDRESS}:8188/history/{prompt_id}"
     with urllib.request.urlopen(url) as response:
         return json.loads(response.read())
 
+def download_file_from_url(url, output_path):
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    result = subprocess.run(
+        ["wget", "-O", output_path, "--no-verbose", url],
+        capture_output=True,
+        text=True
+    )
+    if result.returncode != 0:
+        raise Exception(f"Download failed: {result.stderr}")
+    return output_path
+
+def save_base64_to_file(base64_data, output_path):
+    try:
+        decoded = base64.b64decode(base64_data)
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with open(output_path, "wb") as f:
+            f.write(decoded)
+        return output_path
+    except (binascii.Error, ValueError) as e:
+        raise Exception(f"Base64 decode failed: {e}")
+
+def process_input(value, task_dir, filename, input_type):
+    path = os.path.join(task_dir, filename)
+
+    if input_type == "path":
+        return value
+    elif input_type == "url":
+        return download_file_from_url(value, path)
+    elif input_type == "base64":
+        return save_base64_to_file(value, path)
+    else:
+        raise Exception(f"Unsupported input type: {input_type}")
+
+# ======================
+# COMFY EXECUTION
+# ======================
 def get_videos(ws, prompt):
-    prompt_id = queue_prompt(prompt)['prompt_id']
-    output_videos = {}
+    prompt_id = queue_prompt(prompt)["prompt_id"]
+    logger.info(f"Prompt queued: {prompt_id}")
+
     while True:
-        out = ws.recv()
-        if isinstance(out, str):
-            message = json.loads(out)
-            if message['type'] == 'executing':
-                data = message['data']
-                if data['node'] is None and data['prompt_id'] == prompt_id:
+        msg = ws.recv()
+        if isinstance(msg, str):
+            msg = json.loads(msg)
+            if msg.get("type") == "executing":
+                data = msg.get("data", {})
+                if data.get("node") is None and data.get("prompt_id") == prompt_id:
                     break
-        else:
-            continue
 
     history = get_history(prompt_id)[prompt_id]
-    for node_id in history['outputs']:
-        node_output = history['outputs'][node_id]
-        videos_output = []
-        if 'gifs' in node_output:
-            for video in node_output['gifs']:
-                # fullpath를 이용하여 직접 파일을 읽고 base64로 인코딩
-                with open(video['fullpath'], 'rb') as f:
-                    video_data = base64.b64encode(f.read()).decode('utf-8')
-                videos_output.append(video_data)
-        output_videos[node_id] = videos_output
+    output_urls = []
 
-    return output_videos
+    for node in history["outputs"].values():
+        if "gifs" not in node:
+            continue
 
-def load_workflow(workflow_path):
-    with open(workflow_path, 'r') as file:
-        return json.load(file)
+        for video in node["gifs"]:
+            logger.info(f"Uploading video: {video['fullpath']}")
+            url = rp_upload(
+                file_path=video["fullpath"],
+                key=f"outputs/{uuid.uuid4()}.mp4"
+            )
+            output_urls.append(url)
 
+    return output_urls
 
-def process_input(input_data, temp_dir, output_filename, input_type):
-    """입력 데이터를 처리하여 파일 경로를 반환하는 함수"""
-    if input_type == "path":
-        # 경로인 경우 그대로 반환
-        logger.info(f"📁 경로 입력 처리: {input_data}")
-        return input_data
-    elif input_type == "url":
-        # URL인 경우 다운로드
-        logger.info(f"🌐 URL 입력 처리: {input_data}")
-        os.makedirs(temp_dir, exist_ok=True)
-        file_path = os.path.abspath(os.path.join(temp_dir, output_filename))
-        return download_file_from_url(input_data, file_path)
-    elif input_type == "base64":
-        # Base64인 경우 디코딩하여 저장
-        logger.info(f"🔢 Base64 입력 처리")
-        return save_base64_to_file(input_data, temp_dir, output_filename)
-    else:
-        raise Exception(f"지원하지 않는 입력 타입: {input_type}")
-
-        
-def download_file_from_url(url, output_path):
-    """URL에서 파일을 다운로드하는 함수"""
-    try:
-        # wget을 사용하여 파일 다운로드
-        result = subprocess.run([
-            'wget', '-O', output_path, '--no-verbose', url
-        ], capture_output=True, text=True)
-        
-        if result.returncode == 0:
-            logger.info(f"✅ URL에서 파일을 성공적으로 다운로드했습니다: {url} -> {output_path}")
-            return output_path
-        else:
-            logger.error(f"❌ wget 다운로드 실패: {result.stderr}")
-            raise Exception(f"URL 다운로드 실패: {result.stderr}")
-    except subprocess.TimeoutExpired:
-        logger.error("❌ 다운로드 시간 초과")
-        raise Exception("다운로드 시간 초과")
-    except Exception as e:
-        logger.error(f"❌ 다운로드 중 오류 발생: {e}")
-        raise Exception(f"다운로드 중 오류 발생: {e}")
-
-
-def save_base64_to_file(base64_data, temp_dir, output_filename):
-    """Base64 데이터를 파일로 저장하는 함수"""
-    try:
-        # Base64 문자열 디코딩
-        decoded_data = base64.b64decode(base64_data)
-        
-        # 디렉토리가 존재하지 않으면 생성
-        os.makedirs(temp_dir, exist_ok=True)
-        
-        # 파일로 저장
-        file_path = os.path.abspath(os.path.join(temp_dir, output_filename))
-        with open(file_path, 'wb') as f:
-            f.write(decoded_data)
-        
-        logger.info(f"✅ Base64 입력을 '{file_path}' 파일로 저장했습니다.")
-        return file_path
-    except (binascii.Error, ValueError) as e:
-        logger.error(f"❌ Base64 디코딩 실패: {e}")
-        raise Exception(f"Base64 디코딩 실패: {e}")
-
+# ======================
+# HANDLER
+# ======================
 def handler(job):
     job_input = job.get("input", {})
-
     logger.info(f"Received job input: {job_input}")
-    task_id = f"task_{uuid.uuid4()}"
 
+    task_dir = f"/tmp/task_{uuid.uuid4()}"
+    prompt = None  # 🔥 IMPORTANT FIX
 
+    # ------------------
+    # INPUT FILES
+    # ------------------
     image_path = None
-    # 이미지 입력 처리 (image_path, image_url, image_base64 중 하나만 사용)
-    if "image_path" in job_input:
-        image_path = process_input(job_input["image_path"], task_id, "input_image.jpg", "path")
-    elif "image_url" in job_input:
-        image_path = process_input(job_input["image_url"], task_id, "input_image.jpg", "url")
-    elif "image_base64" in job_input:
-        image_path = process_input(job_input["image_base64"], task_id, "input_image.jpg", "base64")
-
     video_path = None
-    # 비디오 입력 처리 (video_path, video_url, video_base64 중 하나만 사용)
+
+    if "image_path" in job_input:
+        image_path = process_input(job_input["image_path"], task_dir, "input.jpg", "path")
+    elif "image_url" in job_input:
+        image_path = process_input(job_input["image_url"], task_dir, "input.jpg", "url")
+    elif "image_base64" in job_input:
+        image_path = process_input(job_input["image_base64"], task_dir, "input.jpg", "base64")
+
     if "video_path" in job_input:
-        video_path = process_input(job_input["video_path"], task_id, "input_video.mp4", "path")
+        video_path = process_input(job_input["video_path"], task_dir, "input.mp4", "path")
     elif "video_url" in job_input:
-        video_path = process_input(job_input["video_url"], task_id, "input_video.mp4", "url")
+        video_path = process_input(job_input["video_url"], task_dir, "input.mp4", "url")
     elif "video_base64" in job_input:
-        video_path = process_input(job_input["video_base64"], task_id, "input_video.mp4", "base64")
+        video_path = process_input(job_input["video_base64"], task_dir, "input.mp4", "base64")
 
-    check_coord = job_input.get("points_store", None)
+    # ------------------
+    # WORKFLOW SELECT
+    # ------------------
+    has_points = job_input.get("points_store") is not None
+    is_animate = job_input.get("mode", "replace") == "animate"
 
-
-    if check_coord == None:
-        if job_input.get("mode", "replace") == "animate":
-            prompt = load_workflow('/newWanAnimate_noSAM_animate_api.json')
-        else:
-            prompt = load_workflow('/newWanAnimate_noSAM_api.json')
-
-        prompt["57"]["inputs"]["image"] = image_path
-        prompt["63"]["inputs"]["video"] = video_path
-        prompt["63"]["inputs"]["force_rate"] = job_input["fps"]
-        prompt["30"]["inputs"]["frame_rate"] = job_input["fps"]
-        prompt["65"]["inputs"]["positive_prompt"] = job_input["prompt"]
-        if "negative_prompt" in job_input:
-            prompt["65"]["inputs"]["negative_prompt"] = job_input["negative_prompt"]
-        prompt["27"]["inputs"]["seed"] = job_input["seed"]
-        prompt["27"]["inputs"]["cfg"] = job_input["cfg"]
-        prompt["27"]["inputs"]["steps"] = job_input.get("steps", 4)
-        prompt["150"]["inputs"]["value"] = job_input["width"]
-        prompt["151"]["inputs"]["value"] = job_input["height"]
+    if not has_points:
+        prompt = load_workflow(
+            "/newWanAnimate_noSAM_animate_api.json"
+            if is_animate else
+            "/newWanAnimate_noSAM_api.json"
+        )
     else:
-        if job_input.get("mode", "replace") == "animate":
-            prompt = load_workflow('/newWanAnimate_point_animate_api.json')
-        else:
-            prompt = load_workflow('/newWanAnimate_point_api.json')
-        
-        prompt["57"]["inputs"]["image"] = image_path
-        prompt["63"]["inputs"]["video"] = video_path
-        prompt["63"]["inputs"]["force_rate"] = job_input["fps"]
-        prompt["30"]["inputs"]["frame_rate"] = job_input["fps"]
-        prompt["65"]["inputs"]["positive_prompt"] = job_input["prompt"]
-        if "negative_prompt" in job_input:
-            prompt["65"]["inputs"]["negative_prompt"] = job_input["negative_prompt"]
-        prompt["27"]["inputs"]["seed"] = job_input["seed"]
-        prompt["27"]["inputs"]["cfg"] = job_input["cfg"]
-        prompt["27"]["inputs"]["steps"] = job_input.get("steps", 4)
-        prompt["150"]["inputs"]["value"] = job_input["width"]
-        prompt["151"]["inputs"]["value"] = job_input["height"]
+        prompt = load_workflow(
+            "/newWanAnimate_point_animate_api.json"
+            if is_animate else
+            "/newWanAnimate_point_api.json"
+        )
 
+    if prompt is None:
+        raise Exception("Prompt workflow failed to load")
+
+    # ------------------
+    # PROMPT PARAMS
+    # ------------------
+    prompt["57"]["inputs"]["image"] = image_path
+    prompt["63"]["inputs"]["video"] = video_path
+    prompt["63"]["inputs"]["force_rate"] = job_input["fps"]
+    prompt["30"]["inputs"]["frame_rate"] = job_input["fps"]
+    prompt["65"]["inputs"]["positive_prompt"] = job_input["prompt"]
+    prompt["65"]["inputs"]["negative_prompt"] = job_input.get("negative_prompt", "")
+    prompt["27"]["inputs"]["seed"] = job_input["seed"]
+    prompt["27"]["inputs"]["cfg"] = job_input["cfg"]
+    prompt["27"]["inputs"]["steps"] = job_input.get("steps", 4)
+    prompt["150"]["inputs"]["value"] = job_input["width"]
+    prompt["151"]["inputs"]["value"] = job_input["height"]
+
+    if has_points:
         prompt["107"]["inputs"]["points_store"] = job_input["points_store"]
         prompt["107"]["inputs"]["coordinates"] = job_input["coordinates"]
         prompt["107"]["inputs"]["neg_coordinates"] = job_input["neg_coordinates"]
-        # prompt["107"]["inputs"]["width"] = job_input["width"]
-        # prompt["107"]["inputs"]["height"] = job_input["height"]
-    
 
-    ws_url = f"ws://{server_address}:8188/ws?clientId={client_id}"
-    logger.info(f"Connecting to WebSocket: {ws_url}")
-    
-    # 먼저 HTTP 연결이 가능한지 확인
-    http_url = f"http://{server_address}:8188/"
-    logger.info(f"Checking HTTP connection to: {http_url}")
-    
-    # HTTP 연결 확인 (최대 1분)
-    max_http_attempts = 180
-    for http_attempt in range(max_http_attempts):
-        try:
-            import urllib.request
-            response = urllib.request.urlopen(http_url, timeout=5)
-            logger.info(f"HTTP 연결 성공 (시도 {http_attempt+1})")
-            break
-        except Exception as e:
-            logger.warning(f"HTTP 연결 실패 (시도 {http_attempt+1}/{max_http_attempts}): {e}")
-            if http_attempt == max_http_attempts - 1:
-                raise Exception("ComfyUI 서버에 연결할 수 없습니다. 서버가 실행 중인지 확인하세요.")
-            time.sleep(1)
-    
+    # ------------------
+    # CONNECT COMFY
+    # ------------------
+    ws_url = f"ws://{SERVER_ADDRESS}:8188/ws?clientId={CLIENT_ID}"
+
     ws = websocket.WebSocket()
-    # 웹소켓 연결 시도 (최대 3분)
-    max_attempts = int(180/5)  # 3분 (1초에 한 번씩 시도)
-    for attempt in range(max_attempts):
-        import time
-        try:
-            ws.connect(ws_url)
-            logger.info(f"웹소켓 연결 성공 (시도 {attempt+1})")
-            break
-        except Exception as e:
-            logger.warning(f"웹소켓 연결 실패 (시도 {attempt+1}/{max_attempts}): {e}")
-            if attempt == max_attempts - 1:
-                raise Exception("웹소켓 연결 시간 초과 (3분)")
-            time.sleep(5)
-    videos = get_videos(ws, prompt)
-    ws.close()
+    ws.connect(ws_url)
 
-    # 이미지가 없는 경우 처리
-    for node_id in videos:
-        if videos[node_id]:
-            return {"video": videos[node_id][0]}
-    
-    return {"error": "비디오를를 찾을 수 없습니다."}
+    try:
+        video_urls = get_videos(ws, prompt)
+    finally:
+        ws.close()
 
+    if not video_urls:
+        return {"status": "error", "message": "No video generated"}
+
+    return {
+        "status": "ok",
+        "video_url": video_urls[0]
+    }
+
+# ======================
+# START SERVERLESS
+# ======================
 runpod.serverless.start({"handler": handler})
